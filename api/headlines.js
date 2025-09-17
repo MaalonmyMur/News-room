@@ -1,26 +1,19 @@
 import Parser from "rss-parser";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 export const config = { runtime: "nodejs" };
 const parser = new Parser({ timeout: 15000 });
 
-function baseUrl(req) {
-  const host = process.env.VERCEL_URL || req.headers.host;      // works locally & on Vercel
-  return `https://${host}`;
-}
-
 export default async function handler(req, res) {
   try {
-    // 1) Load config from PUBLIC file to avoid bundling/path issues
-    const cfgUrl = `${baseUrl(req)}/sources.json`;
-    const cfgRes = await fetch(cfgUrl, { cache: "no-store" });
-    if (!cfgRes.ok) throw new Error(`Failed to load ${cfgUrl}: HTTP ${cfgRes.status}`);
-    const cfg = await cfgRes.json();
+    // Read config from the deployed bundle (bundled via includeFiles)
+    const cfgPath = path.join(process.cwd(), "public", "sources.json");
+    const cfg = JSON.parse(await readFile(cfgPath, "utf-8"));
 
-    // 2) Read sources
     const perSource = Number((cfg.news && cfg.news.perSource) ?? 10);
     const sources = (cfg.news && cfg.news.sources) || [];
 
-    // 3) Fetch all RSS feeds (no filters)
     const chunks = await Promise.all(
       sources.map(async (entry) => {
         const url = typeof entry === "string" ? entry : entry.url;
@@ -39,8 +32,6 @@ export default async function handler(req, res) {
     );
 
     const flat = chunks.flat();
-
-    // 4) Return as-is
     res.status(200).json({ news: flat, count: flat.length });
   } catch (err) {
     res.status(500).json({ error: String(err) });
