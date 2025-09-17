@@ -7,7 +7,7 @@ export const config = { runtime: "nodejs" };
 const parser = new Parser({ timeout: 15000 });
 
 const RAW_SOURCES_URL =
-  "https://raw.githubusercontent.com/MaalonmyMur/News-room/refs/heads/main/public/sources.json"; 
+  "https://raw.githubusercontent.com/MaalonmyMur/News-room/main/public/sources.json"; 
 
 function siteBase(req) {
   const host = process.env.VERCEL_URL || req.headers.host;
