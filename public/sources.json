@@ -1,0 +1,11 @@
+{
+  "news": {
+    "perSource": 10,
+    "sources": [
+      "https://www.thenewhumanitarian.org/feeds/all",
+      "https://donortracker.org/policy_updates/rss.xml",
+      "https://www.theguardian.com/global-development/rss",
+      "https://reliefweb.int/updates/rss"
+    ]
+  }
+}
