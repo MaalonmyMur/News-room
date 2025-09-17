@@ -4,6 +4,7 @@ import path from "node:path";
 
 export const config = { runtime: "nodejs" };
 const parser = new Parser({ timeout: 15000 });
+const RAW_SOURCES_URL = https://raw.githubusercontent.com/MaalonmyMur/News-room/refs/heads/main/public/sources.json
 
 export default async function handler(req, res) {
   try {
