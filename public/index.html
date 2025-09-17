@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>My Headlines</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;margin:0;background:#f6f6f8;color:#111}
+  header{padding:16px 20px;background:#fff;border-bottom:1px solid #eee;position:sticky;top:0}
+  h1{margin:0;font-size:18px}
+  main{max-width:900px;margin:20px auto;padding:0 16px}
+  ul{list-style:none;padding:0;margin:0}
+  li{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px 16px;margin:10px 0}
+  a{color:inherit;text-decoration:none}
+  a:hover{text-decoration:underline}
+  .meta{font-size:12px;color:#666;margin-top:6px}
+  .error{background:#fff3f3;border:1px solid #ffcaca;border-radius:12px;padding:12px}
+  .empty{opacity:.7}
+</style>
+<header><h1>My Headlines</h1></header>
+<main>
+  <ul id="list"><li>Loading…</li></ul>
+</main>
+<script>
+(async function(){
+  const ul = document.getElementById('list');
+  const render = (items) => {
+    ul.innerHTML = '';
+    if (!items || !items.length) { ul.innerHTML = '<li class="empty">No items.</li>'; return; }
+    items.forEach(it=>{
+      const li = document.createElement('li');
+      li.innerHTML = `<a href="${it.url}" target="_blank" rel="noreferrer">${it.title}</a>
+        <div class="meta">${it.source||''}${it.published ? ' — ' + it.published : ''}</div>`;
+      ul.appendChild(li);
+    });
+  };
+  try {
+    const r = await fetch('/api/headlines', { cache: 'no-store' });
+    const data = await r.json();
+    const items = Array.isArray(data) ? data : (data.news || []);
+    render(items);
+  } catch(e) {
+    ul.innerHTML = '<li class="error">Couldn’t load headlines. Try opening <code>/api/headlines</code>.</li>';
+  }
+})();
+</script>
