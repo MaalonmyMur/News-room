@@ -2,7 +2,7 @@
   "outputDirectory": "public",
   "functions": {
     "api/**/*.js": {
-      "includeFiles": ["public/sources.json"]
+      "includeFiles": "public/sources.json"
     }
   }
 }
