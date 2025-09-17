@@ -1,0 +1,11 @@
+{
+  "name": "news-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo \"no build\""
+  },
+  "dependencies": {
+    "rss-parser": "^3.13.0"
+  }
+}
