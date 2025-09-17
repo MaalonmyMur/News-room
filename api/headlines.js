@@ -5,25 +5,25 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const config = { runtime: "nodejs" };
+
+// Use a single Parser instance
 const parser = new Parser({ timeout: 15000 });
 
-/**
- * Optional fallback: set to your GitHub Raw URL for /public/sources.json
- * e.g. "https://raw.githubusercontent.com/<USER>/<REPO>/<BRANCH>/public/sources.json"
- * Leave as "" to skip this fallback.
- */
-const RAW_SOURCES_URL = "";
+// Browser-like headers to avoid basic bot blocks
+const UA_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+  "accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+  "accept-encoding": "gzip,deflate,br",
+  "accept-language": "en"
+};
 
-// ---------- keywords
-// Funding & donor triggers (included up to 7 days even without region match)
+// ---------- keywords (same as before)
 const FUNDING_WORDS = [
-  // generic finance terms
   "funding","funds","budget","budgets","aid","oda","official development assistance",
   "appropriation","appropriations","spending","cut","cuts","reduction","reductions",
   "increase","increases","pledge","pledges","grant","grants","donor","donors",
   "funding cut","budget cut","funding increase","budget increase",
-
-  // donor agencies / acronyms
   "fcdo","uk aid","usaid","state department","sida","norad","giz","kfw","afd",
   "global affairs canada","irish aid","dfat","dfatd","ausaid","nzaid",
   "jica","koica","adb","afdb","african development bank","isdb","islamic development bank",
@@ -31,23 +31,17 @@ const FUNDING_WORDS = [
   "development finance","development assistance","official aid"
 ];
 
-// Donor-country names (to catch donor-side policy/funding headlines)
 const DONOR_COUNTRY_TERMS = [
-  // Anglosphere
-  "united states","usa","u.s.","us ", "canada","united kingdom","uk","britain","british",
+  "united states","usa","u.s.","us ","canada","united kingdom","uk","britain","british",
   "australia","new zealand","ireland",
-  // Europe (major DAC donors)
   "european union","eu","germany","german","france","french","netherlands","dutch",
   "norway","norwegian","sweden","swedish","denmark","danish","finland","finnish",
   "switzerland","swiss","spain","italy","belgium","austria","luxembourg","portugal",
-  // Asia & others (DAC)
   "japan","japanese","south korea","korea","korean"
 ];
 
-// Merge funding keywords + donor countries
 const FUNDING_TRIGGERS = [...FUNDING_WORDS, ...DONOR_COUNTRY_TERMS];
 
-// Built-in regional keywords (used only if you don’t set `regions` in sources.json)
 const DEFAULT_REGION_WORDS = [
   "africa","sub-saharan","sahel","horn of africa","east africa","west africa","central africa","southern africa",
   "south asia","southeast asia","asean",
@@ -83,7 +77,7 @@ function siteBase(req) {
 }
 
 async function loadConfig(req) {
-  // 1) Try bundled file (vercel.json includeFiles -> public/sources.json)
+  // 1) bundled file (via includeFiles)
   try {
     const p = path.join(process.cwd(), "public", "sources.json");
     if (fs.existsSync(p)) {
@@ -91,25 +85,57 @@ async function loadConfig(req) {
       return JSON.parse(txt);
     }
   } catch (_) {}
-
-  // 2) Try GitHub Raw fallback (optional)
-  if (RAW_SOURCES_URL) {
-    try {
-      const r = await fetch(RAW_SOURCES_URL, { cache: "no-store" });
-      if (r.ok) return await r.json();
-    } catch (_) {}
-  }
-
-  // 3) Try site public URL (can fail on protected previews)
+  // 2) site public URL (works if previews are public)
   try {
     const r = await fetch(`${siteBase(req)}/sources.json`, { cache: "no-store" });
     if (r.ok) return await r.json();
   } catch (_) {}
-
-  throw new Error("Could not load sources.json from disk, GitHub Raw, or site.");
+  throw new Error("Could not load sources.json.");
 }
 
-// ---------- handler
+// ---- hardened feed fetch with fallbacks
+async function fetchFeedWithFallbacks(url) {
+  // Known alternate paths for tricky sources
+  const candidates = [url];
+
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("donortracker.org")) {
+      // some deployments use hyphen instead of underscore or different path
+      candidates.push("https://donortracker.org/policy-updates/rss.xml");
+      candidates.push("https://donortracker.org/policy-updates.xml");
+    }
+    if (u.hostname.includes("thenewhumanitarian.org")) {
+      // TNH variants we've seen in the wild
+      candidates.push("https://www.thenewhumanitarian.org/feeds/all.rss");
+      candidates.push("https://www.thenewhumanitarian.org/rss.xml");
+    }
+  } catch {
+    // ignore URL parse errors; we’ll still try the original
+  }
+
+  // Try each candidate with a real UA, then parseString
+  for (const candidate of candidates) {
+    try {
+      const resp = await fetch(candidate, { headers: UA_HEADERS, cache: "no-store" });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      const feed = await parser.parseString(text);
+      // attach a title fallback if missing
+      feed.title = feed.title || new URL(candidate).host;
+      return feed;
+    } catch {
+      // try next candidate
+    }
+  }
+  // final attempt: rss-parser direct (some servers like this better)
+  try {
+    return await parser.parseURL(url);
+  } catch {
+    throw new Error(`Failed to fetch: ${url}`);
+  }
+}
+
 export default async function handler(req, res) {
   try {
     const cfg = await loadConfig(req);
@@ -117,7 +143,6 @@ export default async function handler(req, res) {
     const zone = cfg.timezone || "UTC";
     const maxAgeDays = Number(cfg.maxAgeDays ?? 3);
 
-    // Use your custom regions if present in public/sources.json, otherwise defaults
     const regionWords =
       Array.isArray(cfg.regions) && cfg.regions.length > 0
         ? cfg.regions.map(s => s.toLowerCase())
@@ -126,12 +151,11 @@ export default async function handler(req, res) {
     const perSource = Number((cfg.news && cfg.news.perSource) ?? 10);
     const sources = (cfg.news && cfg.news.sources) || [];
 
-    // Pull items from all RSS sources
     const chunks = await Promise.all(
       sources.map(async (entry) => {
         const url = typeof entry === "string" ? entry : entry.url;
         try {
-          const feed = await parser.parseURL(url);
+          const feed = await fetchFeedWithFallbacks(url);
           return (feed.items || []).slice(0, perSource).map(it => {
             const published = parseDate(it.isoDate || it.pubDate || it.published || it.updated, zone);
             return {
@@ -139,7 +163,7 @@ export default async function handler(req, res) {
               url: it.link || it.guid || "",
               source: feed.title || new URL(url).host,
               publishedISO: published ? published.toISO() : null,
-              _text: `${it.title || ""} ${feed.title || ""}` // for matching
+              _text: `${it.title || ""} ${feed.title || ""}`
             };
           });
         } catch {
@@ -156,25 +180,22 @@ export default async function handler(req, res) {
 
     const flat = chunks.flat();
 
-    // ----- FILTERING LOGIC -----
-    // Funding items: always include up to 7 days old (ignores region).
-    // Region items: include if within maxAgeDays AND match region keywords.
+    // ---- filtering logic (Option B with 7-day funding window)
     const filtered = flat.filter(it => {
       const text = it._text.toLowerCase();
       const isFunding = matchAny(text, FUNDING_TRIGGERS);
       const hasRegion = matchAny(text, regionWords);
 
       const dt = it.publishedISO ? DateTime.fromISO(it.publishedISO).setZone(zone) : null;
-      const recent = isWithinDays(dt, maxAgeDays, zone);
-      const fundingRecent = isWithinDays(dt, 7, zone) || !dt; // if no date, keep funding; change to '&& dt' if you require dates
+
+      const recent = isWithinDays(dt, maxAgeDays, zone); // region window (e.g., 3 days)
+      const fundingRecent = isWithinDays(dt, 7, zone) || !dt; // funding window (7 days, allow no date)
 
       return (isFunding && fundingRecent) || (hasRegion && recent);
     });
 
-    // Sort newest first
     filtered.sort((a, b) => (b.publishedISO || "").localeCompare(a.publishedISO || ""));
 
-    // Map to output shape
     const out = filtered.map(({ title, url, source, publishedISO }) => ({
       title, url, source, published: publishedISO
     }));
@@ -182,6 +203,6 @@ export default async function handler(req, res) {
     res.setHeader("Cache-Control", "s-maxage=900, stale-while-revalidate=300");
     res.status(200).json({ news: out, count: out.length, timezone: zone });
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    res.status(200).json({ news: [], count: 0, error: String(err) }); // return 200 with error so page doesn't look "broken"
   }
 }
