@@ -1,12 +1,13 @@
 {
   "name": "news-dashboard",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "echo \"no build\""
   },
   "dependencies": {
-    "rss-parser": "^3.13.0"
+    "rss-parser": "^3.13.0",
     "luxon": "^3.5.0"
   }
 }
