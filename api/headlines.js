@@ -4,16 +4,18 @@ import { DateTime } from "luxon";
 import { readFile } from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
+import * as cheerio from "cheerio";
 
 export const config = { runtime: "nodejs" };
 
 const parser = new Parser({ timeout: 20000 });
 
-// Super browsery headers; some sites block generic bots.
+// Browser-like headers to avoid bot blocking
 const UA_HEADERS = {
   "user-agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-  "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml;q=0.9,*/*;q=0.8",
+  "accept":
+    "text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml;q=0.9,*/*;q=0.8",
   "accept-language": "en-GB,en;q=0.9",
   "cache-control": "no-cache",
   "pragma": "no-cache",
@@ -78,24 +80,24 @@ function siteBase(req) {
 }
 
 async function loadConfig(req) {
+  // 1) read bundled file (vercel includeFiles)
   try {
     const p = path.join(process.cwd(), "public", "sources.json");
     if (fs.existsSync(p)) return JSON.parse(await readFile(p, "utf-8"));
   } catch {}
+  // 2) fall back to public URL
   const r = await fetch(`${siteBase(req)}/sources.json`, { cache: "no-store" });
   if (r.ok) return await r.json();
   throw new Error("Could not load sources.json.");
 }
 
-// ----- Source-specific fetchers (return array of {title,url,source,publishedISO,_text})
-
-async function fetchReliefWeb(perSource, zone, debug) {
-  // Reliable JSON API; profile=simple avoids huge payloads.
+// ----- ReliefWeb via official API
+async function fetchReliefWeb(perSource, zone) {
   const url = `https://api.reliefweb.int/v1/reports?appname=news-dashboard&profile=simple&sort[]=date:desc&limit=${perSource}`;
   const resp = await fetch(url, { headers: { ...UA_HEADERS, accept: "application/json" }, cache: "no-store" });
   if (!resp.ok) throw new Error(`ReliefWeb API HTTP ${resp.status}`);
   const json = await resp.json();
-  const items = (json.data || []).map(d => {
+  return (json.data || []).map(d => {
     const t = d?.fields?.title || "(no title)";
     const href = d?.fields?.url || "";
     const published = d?.fields?.date?.created || d?.fields?.date?.original || null;
@@ -108,53 +110,79 @@ async function fetchReliefWeb(perSource, zone, debug) {
       _text: `${t} ReliefWeb`
     };
   });
-  if (debug) items.unshift({ title: `[dbg] reliefweb count=${items.length}`, url: "", source: "dbg", publishedISO: null, _text: "" });
-  return items;
 }
 
-async function fetchDonorTracker(perSource, zone, debug) {
+// ----- DonorTracker (Cheerio) — returns originalUrl when available
+async function fetchDonorTracker(perSource, zone) {
   const candidates = [
     "https://donortracker.org/policy_updates",
     "https://donortracker.org/policy-updates"
   ];
-  let lastErr = "";
   for (const u of candidates) {
     try {
       const htmlRes = await fetch(u, { headers: UA_HEADERS, cache: "no-store" });
-      if (!htmlRes.ok) { lastErr = `HTTP ${htmlRes.status}`; continue; }
+      if (!htmlRes.ok) continue;
       const html = await htmlRes.text();
+      const $ = cheerio.load(html);
 
-      // Extract anchors + optional datetime next to them
-      const itemRegex = /<a[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>[\s\S]{0,250}?(?:<time[^>]*datetime="([^"]+)")?/gi;
       const out = [];
-      let m;
-      while ((m = itemRegex.exec(html)) && out.length < perSource) {
-        const href = m[1].startsWith("http") ? m[1] : `https://donortracker.org${m[1]}`;
-        // Filter to policy-updates detail pages (avoid menus)
-        if (!/\/(policy[_-]updates|news|insights|policy)\/?/i.test(href)) continue;
-        const title = m[2].replace(/<[^>]+>/g, "").trim();
-        const rawDate = m[3] || null;
-        const dt = parseDate(rawDate, zone);
-        if (title && href) {
-          out.push({
-            title,
-            url: href,
-            source: "Donor Tracker — Policy Updates",
-            publishedISO: dt ? dt.toISO() : null,
-            _text: `${title} DonorTracker`
-          });
+      $(".views-row, article, .card").each((_, el) => {
+        if (out.length >= perSource) return;
+        const $el = $(el);
+
+        // DT internal page
+        let internalHref =
+          $el.find('a[href^="/policy-"], a[href*="/policy-"]').first().attr("href") || "";
+        if (internalHref && !internalHref.startsWith("http")) {
+          internalHref = "https://donortracker.org" + internalHref;
         }
-      }
-      if (debug) out.unshift({ title: `[dbg] donortracker count=${out.length} lastErr=${lastErr}`, url: "", source: "dbg", publishedISO: null, _text: "" });
+
+        // External/original link (first non-DT link inside the card)
+        let extHref = "";
+        $el.find("a[href]").each((__, a) => {
+          const href = $(a).attr("href") || "";
+          const absolute = href.startsWith("http")
+            ? href
+            : href.startsWith("/")
+              ? "https://donortracker.org" + href
+              : "";
+          if (!absolute) return;
+          if (!absolute.includes("donortracker.org")) {
+            extHref = absolute;
+            return false; // break
+          }
+        });
+
+        // Title from internal link, else first link
+        let title =
+          $el.find('a[href^="/policy-"], a[href*="/policy-"]').first().text().trim() ||
+          $el.find("a[href]").first().text().trim() || "";
+        title = title.replace(/\s+/g, " ").trim();
+
+        const rawDate = $el.find("time[datetime]").first().attr("datetime") || "";
+        const dt = parseDate(rawDate, zone);
+
+        const url = internalHref || extHref;
+        if (!title || !url) return;
+
+        out.push({
+          title,
+          url,                                           // main link → DT summary if available
+          originalUrl: internalHref && extHref ? extHref : null, // optional secondary link
+          source: "Donor Tracker — Policy Updates",
+          publishedISO: dt ? dt.toISO() : null,
+          _text: `${title} DonorTracker`
+        });
+      });
+
       if (out.length) return out;
-    } catch (e) {
-      lastErr = e.message;
-    }
+    } catch {}
   }
-  throw new Error(`DonorTracker scrape failed (${lastErr||"no items"})`);
+  throw new Error("DonorTracker scrape failed");
 }
 
-async function fetchRSS(url, perSource, zone, debug) {
+// ----- Generic RSS (Guardian, TNH, etc.)
+async function fetchRSS(url, perSource, zone) {
   const candidates = [url];
   try {
     const u = new URL(url);
@@ -165,15 +193,14 @@ async function fetchRSS(url, perSource, zone, debug) {
     }
   } catch {}
 
-  let lastErr = "";
   for (const c of candidates) {
     try {
       const resp = await fetch(c, { headers: UA_HEADERS, cache: "no-store" });
-      if (!resp.ok) { lastErr = `HTTP ${resp.status}`; continue; }
+      if (!resp.ok) continue;
       const text = await resp.text();
       const feed = await parser.parseString(text);
       const title = feed.title || new URL(c).host;
-      const items = (feed.items || []).slice(0, perSource).map(it => {
+      return (feed.items || []).slice(0, perSource).map(it => {
         const published = parseDate(it.isoDate || it.pubDate || it.published || it.updated, zone);
         return {
           title: it.title || "(no title)",
@@ -183,35 +210,12 @@ async function fetchRSS(url, perSource, zone, debug) {
           _text: `${it.title || ""} ${title}`
         };
       });
-      if (debug) items.unshift({ title: `[dbg] rss ok via ${c}`, url: "", source: "dbg", publishedISO: null, _text: "" });
-      return items;
-    } catch (e) {
-      lastErr = e.message;
-    }
+    } catch {}
   }
-  // Final try — library fetch
-  try {
-    const f = await parser.parseURL(url);
-    const title = f.title || new URL(url).host;
-    const items = (f.items || []).slice(0, perSource).map(it => {
-      const published = parseDate(it.isoDate || it.pubDate || it.published || it.updated, zone);
-      return {
-        title: it.title || "(no title)",
-        url: it.link || it.guid || "",
-        source: title,
-        publishedISO: published ? published.toISO() : null,
-        _text: `${it.title || ""} ${title}`
-      };
-    });
-    if (debug) items.unshift({ title: `[dbg] rss ok via parser.parseURL(${url})`, url: "", source: "dbg", publishedISO: null, _text: "" });
-    return items;
-  } catch (e) {
-    throw new Error(`RSS failed (${lastErr || e.message}) for ${url}`);
-  }
+  throw new Error(`RSS failed for ${url}`);
 }
 
 export default async function handler(req, res) {
-  const debug = req.url.includes("debug=1"); // add ?debug=1 to see reasons
   try {
     const cfg = await loadConfig(req);
 
@@ -231,13 +235,12 @@ export default async function handler(req, res) {
         const url = typeof entry === "string" ? entry : entry.url;
         try {
           const host = new URL(url).hostname;
-          if (host.includes("reliefweb.int")) return await fetchReliefWeb(perSource, zone, debug);
-          if (host.includes("donortracker.org")) return await fetchDonorTracker(perSource, zone, debug);
-          return await fetchRSS(url, perSource, zone, debug); // Guardian, TNH, others
+          if (host.includes("reliefweb.int")) return await fetchReliefWeb(perSource, zone);
+          if (host.includes("donortracker.org")) return await fetchDonorTracker(perSource, zone);
+          return await fetchRSS(url, perSource, zone);
         } catch (e) {
-          const msg = e?.message || String(e);
           return [{
-            title: debug ? `[error] ${msg}` : `Failed to fetch: ${url}`,
+            title: `Failed to fetch: ${url} (${e.message})`,
             url: "",
             source: "error",
             publishedISO: null,
@@ -257,16 +260,16 @@ export default async function handler(req, res) {
 
       const dt = it.publishedISO ? DateTime.fromISO(it.publishedISO).setZone(zone) : null;
 
-      const recent = isWithinDays(dt, maxAgeDays, zone);     // region window
-      const fundingRecent = isWithinDays(dt, 7, zone) || !dt; // funding window (allow undated)
+      const recent = isWithinDays(dt, maxAgeDays, zone);      // region window
+      const fundingRecent = isWithinDays(dt, 7, zone) || !dt; // funding window (7 days; allow undated)
 
       return (isFunding && fundingRecent) || (hasRegion && recent);
     });
 
     filtered.sort((a, b) => (b.publishedISO || "").localeCompare(a.publishedISO || ""));
 
-    const out = filtered.map(({ title, url, source, publishedISO }) => ({
-      title, url, source, published: publishedISO
+    const out = filtered.map(({ title, url, source, publishedISO, originalUrl }) => ({
+      title, url, source, published: publishedISO, originalUrl: originalUrl || undefined
     }));
 
     res.setHeader("Cache-Control", "s-maxage=900, stale-while-revalidate=300");
