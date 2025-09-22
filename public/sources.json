@@ -11,11 +11,3 @@
     ]
   }
 }
-  "regions": [
-    "africa", "south asia", "southeast asia",
-    "ethiopia", "zambia", "rwanda", "uganda", "tanzania", "kenya", "burundi",
-    "democratic republic of congo", "drc", "nigeria", "benin", "togo", "senegal",
-    "ivory coast", "cote d'ivoire", "mali", "niger", "south sudan",
-    "bangladesh", "indonesia", "philippines", "tibet", "vietnam", "sahel"
-  ]
-}
