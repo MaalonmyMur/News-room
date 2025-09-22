@@ -1,18 +1,16 @@
 {
   "timezone": "Europe/Amsterdam",
   "maxAgeDays": 3,
-  "includeFunding": true,
-
   "news": {
     "perSource": 10,
     "sources": [
-      "https://www.thenewhumanitarian.org/feeds/all",
-      "https://donortracker.org/policy_updates/rss.xml",
+      "http://www.thenewhumanitarian.org/rss/all.xml",
+      "https://api.reliefweb.int/v2/reports?preset=latest&appname=news-dashboard&limit=20",
       "https://www.theguardian.com/global-development/rss",
-      "https://reliefweb.int/updates/rss"
+      "https://donortracker.org/policy_updates"
     ]
-  },
-
+  }
+}
   "regions": [
     "africa", "south asia", "southeast asia",
     "ethiopia", "zambia", "rwanda", "uganda", "tanzania", "kenya", "burundi",
