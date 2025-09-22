@@ -4,8 +4,8 @@
   "news": {
     "perSource": 10,
     "sources": [
-      "http://www.thenewhumanitarian.org/rss/all.xml",
-      "https://api.reliefweb.int/v2/reports?preset=latest&appname=news-dashboard&limit=20",
+      "https://www.thenewhumanitarian.org/aid-and-policy",
+      "https://reliefweb.int/updates", 
       "https://www.theguardian.com/global-development/rss",
       "https://donortracker.org/policy_updates"
     ]
