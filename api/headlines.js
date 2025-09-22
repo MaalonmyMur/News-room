@@ -89,34 +89,6 @@ async function loadConfig(req) {
   throw new Error("Could not load sources.json.");
 }
 
-// ---------- source fetchers (return {items, meta})
-
-async function fetchReliefWeb(perSource, zone) {
-  const meta = { source: "ReliefWeb Updates", errors: [] };
-  // v2 + preset=latest
-  const url = `https://api.reliefweb.int/v2/reports?preset=latest&appname=news-dashboard&limit=${perSource}`;
-  const resp = await fetch(url, { headers: { ...UA_HEADERS, accept: "application/json" }, cache: "no-store" });
-  if (!resp.ok) { meta.errors.push(`HTTP ${resp.status}`); return { items: [], meta }; }
-  const json = await resp.json();
-  const items = (json.data || []).map(d => {
-    const t = d?.fields?.title || "(no title)";
-    const href = d?.fields?.url || "";
-    const published =
-      d?.fields?.date?.created ||
-      d?.fields?.date?.original ||
-      d?.fields?.date?.changed || null;
-    const dt = parseDate(published, zone);
-    return {
-      title: t,
-      url: href,
-      source: "ReliefWeb Updates",
-      publishedISO: dt ? dt.toISO() : null,
-      _text: `${t} ReliefWeb`
-    };
-  });
-  return { items, meta };
-}
-
 function slugify(s){
   return (s || "")
     .toLowerCase()
@@ -126,6 +98,132 @@ function slugify(s){
     .slice(0, 120);
 }
 
+// ---------- source fetchers (return {items, meta})
+
+// ReliefWeb: API v1 (profile=lite) with RSS fallback
+async function fetchReliefWebSmart(perSource, zone, urlHint = "") {
+  const meta = { source: "ReliefWeb Updates", errors: [] };
+
+  // 1) API v1 (robust + structured)
+  try {
+    const apiUrl = `https://api.reliefweb.int/v1/reports?profile=lite&sort[]=date:desc&limit=${perSource}`;
+    const resp = await fetch(apiUrl, { headers: { ...UA_HEADERS, accept: "application/json" }, cache: "no-store" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const json = await resp.json();
+    const data = Array.isArray(json?.data) ? json.data : [];
+    const items = data.map(d => {
+      const t = d?.fields?.title || "(no title)";
+      const href = d?.fields?.url || "";
+      const published =
+        d?.fields?.date?.created ||
+        d?.fields?.date?.original ||
+        d?.fields?.date?.changed || null;
+      const dt = parseDate(published, zone);
+      return {
+        title: t,
+        url: href,
+        source: "ReliefWeb Updates",
+        publishedISO: dt ? dt.toISO() : null,
+        _text: `${t} ReliefWeb`
+      };
+    });
+    if (items.length) return { items, meta };
+    meta.errors.push("API v1 returned 0 items");
+  } catch (e) {
+    meta.errors.push(`API v1 error: ${e.message || e}`);
+  }
+
+  // 2) RSS fallback
+  try {
+    const rssUrl = "https://reliefweb.int/updates/rss";
+    const resp = await fetch(rssUrl, { headers: UA_HEADERS, cache: "no-store" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const txt = await resp.text();
+    const feed = await parser.parseString(txt);
+    const items = (feed.items || []).slice(0, perSource).map(it => {
+      const published = parseDate(it.isoDate || it.pubDate || it.published || it.updated, zone);
+      return {
+        title: it.title || "(no title)",
+        url: it.link || it.guid || "",
+        source: feed.title || "ReliefWeb Updates",
+        publishedISO: published ? published.toISO() : null,
+        _text: `${it.title || ""} ReliefWeb`
+      };
+    });
+    return { items, meta };
+  } catch (e) {
+    meta.errors.push(`RSS fallback error: ${e.message || e}`);
+  }
+
+  return { items: [], meta };
+}
+
+// The New Humanitarian: scrape the section page (aid-and-policy)
+async function fetchTNHAidAndPolicy(perSource, zone, pageUrl) {
+  const meta = { source: "The New Humanitarian — Aid & Policy", errors: [] };
+  try {
+    const resp = await fetch(pageUrl, { headers: UA_HEADERS, cache: "no-store" });
+    if (!resp.ok) return { items: [], meta: { ...meta, errors: [`HTTP ${resp.status}`] } };
+    const html = await resp.text();
+    const $ = cheerio.load(html);
+
+    const items = [];
+    // Articles typically appear as <article> tiles with an <h2><a>
+    $("article, .node--type-article, .teaser").each((_, el) => {
+      if (items.length >= perSource) return;
+      const $el = $(el);
+      const a = $el.find("h2 a, .teaser__title a, a.teaser__title").first();
+      const title = a.text().replace(/\s+/g, " ").trim();
+      let href = a.attr("href") || "";
+      if (!title || !href) return;
+
+      if (!href.startsWith("http")) href = "https://www.thenewhumanitarian.org" + href;
+
+      // date lives in <time datetime="..."> or in meta text
+      let publishedISO = null;
+      const dtAttr =
+        $el.find("time[datetime]").first().attr("datetime") ||
+        $el.find("time").first().text().trim() ||
+        "";
+      const dt = parseDate(dtAttr, zone);
+      if (dt?.isValid) publishedISO = dt.toISO();
+
+      items.push({
+        title,
+        url: href,
+        source: "The New Humanitarian — Aid & Policy",
+        publishedISO,
+        _text: `${title} The New Humanitarian Aid & Policy`
+      });
+    });
+
+    // Fallback: directly scan the main list container for headings
+    if (!items.length) {
+      $("h2 a").each((_, el) => {
+        if (items.length >= perSource) return;
+        const $a = $(el);
+        const title = $a.text().replace(/\s+/g, " ").trim();
+        let href = $a.attr("href") || "";
+        if (!title || !href) return;
+        if (!href.startsWith("http")) href = "https://www.thenewhumanitarian.org" + href;
+        items.push({
+          title,
+          url: href,
+          source: "The New Humanitarian — Aid & Policy",
+          publishedISO: null,
+          _text: `${title} The New Humanitarian Aid & Policy`
+        });
+      });
+    }
+
+    return { items: items.slice(0, perSource), meta };
+  } catch (e) {
+    meta.errors.push(e.message || e);
+    return { items: [], meta };
+  }
+}
+
+// DonorTracker (Cheerio) — headings as title + external original link
 async function fetchDonorTracker(perSource, zone) {
   const meta = { source: "Donor Tracker — Policy Updates", errors: [] };
   const page = "https://donortracker.org/policy_updates";
@@ -135,17 +233,15 @@ async function fetchDonorTracker(perSource, zone) {
   const $ = cheerio.load(html);
 
   const items = [];
-  // DonorTracker list: headings with links nearby
   $("h3").each((_, h) => {
     if (items.length >= perSource) return;
     const $h = $(h);
     const title = $h.text().replace(/\s+/g, " ").trim();
     if (!title) return;
 
-    // Stable internal link back to the list with an anchor-like query
     const url = `${page}?policy=${slugify(title)}`;
 
-    // Find first external link near this heading
+    // grab the first non-DT link near the heading as originalUrl
     let originalUrl = "";
     let n = $h.next();
     for (let i = 0; i < 8 && n && n.length; i++) {
@@ -157,7 +253,7 @@ async function fetchDonorTracker(perSource, zone) {
       n = n.next();
     }
 
-    // Try to infer a date from nearby text (optional)
+    // try parsing a nearby date (optional)
     let publishedISO = null;
     let dnode = $h.next();
     for (let i = 0; i < 3 && dnode && dnode.length && !publishedISO; i++) {
@@ -172,8 +268,8 @@ async function fetchDonorTracker(perSource, zone) {
 
     items.push({
       title,
-      url,                                    // main link → DT list (stable)
-      originalUrl: originalUrl || undefined,  // optional "Read original"
+      url,
+      originalUrl: originalUrl || undefined,
       source: "Donor Tracker — Policy Updates",
       publishedISO: publishedISO || null,
       _text: `${title} DonorTracker`
@@ -184,13 +280,13 @@ async function fetchDonorTracker(perSource, zone) {
   return { items: items.slice(0, perSource), meta };
 }
 
+// Generic RSS (Guardian, etc.) — with TNH feed fallbacks if a feed URL is passed
 async function fetchRSS(url, perSource, zone) {
   const meta = { source: url, errors: [] };
   const candidates = [url];
   try {
     const u = new URL(url);
     if (u.hostname.includes("thenewhumanitarian.org")) {
-      // working TNH feed + fallbacks
       candidates.push("http://www.thenewhumanitarian.org/rss/all.xml");
       candidates.push("https://www.thenewhumanitarian.org/rss.xml");
       candidates.push("https://www.thenewhumanitarian.org/feeds/all.rss");
@@ -241,10 +337,21 @@ export default async function handler(req, res) {
       sources.map(async (entry) => {
         const url = typeof entry === "string" ? entry : entry.url;
         try {
-          const host = new URL(url).hostname;
-          if (host.includes("reliefweb.int")) return await fetchReliefWeb(perSource, zone);
-          if (host.includes("donortracker.org")) return await fetchDonorTracker(perSource, zone);
-          return await fetchRSS(url, perSource, zone); // Guardian, TNH, others
+          const u = new URL(url);
+          const host = u.hostname;
+          const pathn = u.pathname || "";
+
+          if (host.includes("reliefweb.int")) {
+            return await fetchReliefWebSmart(perSource, zone, url);
+          }
+          if (host.includes("thenewhumanitarian.org") && pathn.includes("/aid-and-policy")) {
+            return await fetchTNHAidAndPolicy(perSource, zone, url);
+          }
+          if (host.includes("donortracker.org")) {
+            return await fetchDonorTracker(perSource, zone);
+          }
+          // Guardian + any other RSS
+          return await fetchRSS(url, perSource, zone);
         } catch (e) {
           return { items: [], meta: { source: url, errors: [String(e)] } };
         }
