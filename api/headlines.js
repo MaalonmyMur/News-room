@@ -89,20 +89,22 @@ async function loadConfig(req) {
   throw new Error("Could not load sources.json.");
 }
 
-// ----- fetchers return {items, meta}
+// ---------- source fetchers (return {items, meta})
+
 async function fetchReliefWeb(perSource, zone) {
   const meta = { source: "ReliefWeb Updates", errors: [] };
-  const url = `https://api.reliefweb.int/v1/reports?appname=news-dashboard&profile=simple&sort[]=date:desc&limit=${perSource}`;
+  // v2 + preset=latest
+  const url = `https://api.reliefweb.int/v2/reports?preset=latest&appname=news-dashboard&limit=${perSource}`;
   const resp = await fetch(url, { headers: { ...UA_HEADERS, accept: "application/json" }, cache: "no-store" });
-  if (!resp.ok) {
-    meta.errors.push(`HTTP ${resp.status}`);
-    return { items: [], meta };
-  }
+  if (!resp.ok) { meta.errors.push(`HTTP ${resp.status}`); return { items: [], meta }; }
   const json = await resp.json();
   const items = (json.data || []).map(d => {
     const t = d?.fields?.title || "(no title)";
     const href = d?.fields?.url || "";
-    const published = d?.fields?.date?.created || d?.fields?.date?.original || null;
+    const published =
+      d?.fields?.date?.created ||
+      d?.fields?.date?.original ||
+      d?.fields?.date?.changed || null;
     const dt = parseDate(published, zone);
     return {
       title: t,
@@ -115,72 +117,71 @@ async function fetchReliefWeb(perSource, zone) {
   return { items, meta };
 }
 
+function slugify(s){
+  return (s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .slice(0, 120);
+}
+
 async function fetchDonorTracker(perSource, zone) {
   const meta = { source: "Donor Tracker — Policy Updates", errors: [] };
-  const candidates = [
-    "https://donortracker.org/policy_updates",
-    "https://donortracker.org/policy-updates"
-  ];
-  for (const u of candidates) {
-    try {
-      const htmlRes = await fetch(u, { headers: UA_HEADERS, cache: "no-store" });
-      if (!htmlRes.ok) { meta.errors.push(`${u} → HTTP ${htmlRes.status}`); continue; }
-      const html = await htmlRes.text();
-      const $ = cheerio.load(html);
+  const page = "https://donortracker.org/policy_updates";
+  const resp = await fetch(page, { headers: UA_HEADERS, cache: "no-store" });
+  if (!resp.ok) { meta.errors.push(`HTTP ${resp.status}`); return { items: [], meta }; }
+  const html = await resp.text();
+  const $ = cheerio.load(html);
 
-      const items = [];
-      $(".views-row, article, .card").each((_, el) => {
-        if (items.length >= perSource) return;
-        const $el = $(el);
+  const items = [];
+  // DonorTracker list: headings with links nearby
+  $("h3").each((_, h) => {
+    if (items.length >= perSource) return;
+    const $h = $(h);
+    const title = $h.text().replace(/\s+/g, " ").trim();
+    if (!title) return;
 
-        // internal DT page
-        let internalHref =
-          $el.find('a[href^="/policy-"], a[href*="/policy-"]').first().attr("href") || "";
-        if (internalHref && !internalHref.startsWith("http")) {
-          internalHref = "https://donortracker.org" + internalHref;
-        }
+    // Stable internal link back to the list with an anchor-like query
+    const url = `${page}?policy=${slugify(title)}`;
 
-        // external/original link
-        let extHref = "";
-        $el.find("a[href]").each((__, a) => {
-          const href = $(a).attr("href") || "";
-          const absolute = href.startsWith("http")
-            ? href
-            : href.startsWith("/")
-              ? "https://donortracker.org" + href
-              : "";
-          if (!absolute) return;
-          if (!absolute.includes("donortracker.org")) { extHref = absolute; return false; }
-        });
-
-        let title =
-          $el.find('a[href^="/policy-"], a[href*="/policy-"]').first().text().trim() ||
-          $el.find("a[href]").first().text().trim() || "";
-        title = title.replace(/\s+/g, " ").trim();
-
-        const rawDate = $el.find("time[datetime]").first().attr("datetime") || "";
-        const dt = parseDate(rawDate, zone);
-
-        const url = internalHref || extHref;
-        if (!title || !url) return;
-
-        items.push({
-          title,
-          url,
-          originalUrl: internalHref && extHref ? extHref : null,
-          source: "Donor Tracker — Policy Updates",
-          publishedISO: dt ? dt.toISO() : null,
-          _text: `${title} DonorTracker`
-        });
-      });
-
-      if (items.length) return { items, meta };
-      meta.errors.push(`${u} → no items matched selectors`);
-    } catch (e) {
-      meta.errors.push(`${u} → ${e.message || e}`);
+    // Find first external link near this heading
+    let originalUrl = "";
+    let n = $h.next();
+    for (let i = 0; i < 8 && n && n.length; i++) {
+      const a = n.find("a[href]").filter((__, el) => {
+        const href = $(el).attr("href") || "";
+        return href.startsWith("http") && !href.includes("donortracker.org");
+      }).first();
+      if (a && a.attr("href")) { originalUrl = a.attr("href"); break; }
+      n = n.next();
     }
-  }
-  return { items: [], meta };
+
+    // Try to infer a date from nearby text (optional)
+    let publishedISO = null;
+    let dnode = $h.next();
+    for (let i = 0; i < 3 && dnode && dnode.length && !publishedISO; i++) {
+      const txt = dnode.text();
+      const m = txt && txt.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}/i);
+      if (m) {
+        const dt = parseDate(m[0], zone);
+        if (dt?.isValid) publishedISO = dt.toISO();
+      }
+      dnode = dnode.next();
+    }
+
+    items.push({
+      title,
+      url,                                    // main link → DT list (stable)
+      originalUrl: originalUrl || undefined,  // optional "Read original"
+      source: "Donor Tracker — Policy Updates",
+      publishedISO: publishedISO || null,
+      _text: `${title} DonorTracker`
+    });
+  });
+
+  if (!items.length) meta.errors.push("no headings found");
+  return { items: items.slice(0, perSource), meta };
 }
 
 async function fetchRSS(url, perSource, zone) {
@@ -189,9 +190,10 @@ async function fetchRSS(url, perSource, zone) {
   try {
     const u = new URL(url);
     if (u.hostname.includes("thenewhumanitarian.org")) {
+      // working TNH feed + fallbacks
+      candidates.push("http://www.thenewhumanitarian.org/rss/all.xml");
       candidates.push("https://www.thenewhumanitarian.org/rss.xml");
       candidates.push("https://www.thenewhumanitarian.org/feeds/all.rss");
-      candidates.push("https://thenewhumanitarian.org/rss.xml");
     }
   } catch {}
 
@@ -235,7 +237,6 @@ export default async function handler(req, res) {
     const perSource = Number((cfg.news && cfg.news.perSource) ?? 10);
     const sources = (cfg.news && cfg.news.sources) || [];
 
-    // Fetch per source
     const perSourceResults = await Promise.all(
       sources.map(async (entry) => {
         const url = typeof entry === "string" ? entry : entry.url;
@@ -243,19 +244,18 @@ export default async function handler(req, res) {
           const host = new URL(url).hostname;
           if (host.includes("reliefweb.int")) return await fetchReliefWeb(perSource, zone);
           if (host.includes("donortracker.org")) return await fetchDonorTracker(perSource, zone);
-          return await fetchRSS(url, perSource, zone); // Guardian, TNH, etc.
+          return await fetchRSS(url, perSource, zone); // Guardian, TNH, others
         } catch (e) {
           return { items: [], meta: { source: url, errors: [String(e)] } };
         }
       })
     );
 
-    // Special modes for diagnosis
+    // Diagnostic modes
     const urlObj = new URL(req.url, "https://dummy");
     const mode = urlObj.searchParams.get("mode"); // "raw" | "debug" | null
 
     if (mode === "raw") {
-      // No filters; show items grouped by source with errors/counters
       const payload = perSourceResults.map(r => ({
         source: r.meta?.source || "",
         count: r.items.length,
@@ -268,10 +268,9 @@ export default async function handler(req, res) {
       return res.status(200).json({ mode: "raw", fetchedAt: new Date().toISOString(), sources: payload });
     }
 
-    // Flatten for filtering
     const flat = perSourceResults.flatMap(r => r.items);
 
-    // ---- filtering logic (Option B with 7-day funding window)
+    // Filters: funding kept 7d; regions kept within maxAgeDays
     const filtered = flat.filter(it => {
       const text = it._text?.toLowerCase() || "";
       const isFunding = matchAny(text, FUNDING_TRIGGERS);
@@ -282,10 +281,8 @@ export default async function handler(req, res) {
       return (isFunding && fundingRecent) || (hasRegion && recent);
     });
 
-    // Sort newest first
     filtered.sort((a, b) => (b.publishedISO || "").localeCompare(a.publishedISO || ""));
 
-    // Output
     const out = filtered.map(({ title, url, source, publishedISO, originalUrl }) => ({
       title, url, source, published: publishedISO, originalUrl: originalUrl || undefined
     }));
